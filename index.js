@@ -1,44 +1,196 @@
 #!/usr/bin/env node
 /**
- * cursor-search-mcp v1.0 — B 路线：纯协议 MCP server。
+ * cursor-search-mcp — Cursor web search as an MCP tool. Pure protocol client,
+ * no cursor-agent binary required. Zero npm dependencies (Node.js >= 18).
  *
- * 不再启动 cursor-agent 进程。直接实现 Cursor AgentService 协议（见 agent-protocol.js）：
- *   - 登录: API key → exchange_user_api_key → accessToken（缓存 + 自动续期）
- *   - 搜索: RunSSE + BidiAppend 纯 HTTP 协议客户端，自动批准 web search 交互
+ * MCP server (default, no args):
+ *   stdio JSON-RPC 2024-11-05. Login-aware initialize instructions.
  *
- * 工具:
- *   cursor_login      — 校验 key / 报告 token 状态
- *   cursor_web_search — 联网搜索（Cursor 服务端 web search，纯协议直连）
+ * CLI:
+ *   cursor-search-mcp login     OAuth browser login (prints URL, waits, caches token)
+ *   cursor-search-mcp status    Report login/token state
+ *   cursor-search-mcp search    One-shot web search from the terminal
+ *   cursor-search-mcp help     Show usage
  *
- * 依赖: 仅 Node.js ≥ 18（零 npm 依赖）
+ * Login sources (first match wins):
+ *   CURSOR_API_KEY env or ~/.cursor-search-mcp/key  → auto token exchange
+ *   ~/.cursor-search-mcp/auth.json                   → cached token (auto-refresh)
+ *   OAuth browser login                              → `login` command or MCP tools
  */
 "use strict";
 
 const path = require("node:path");
 const os = require("node:os");
-const { runSearch, ensureToken, API_BASE, DEFAULT_MODEL, startOAuthLogin, pollOAuthLogin } = require("./agent-protocol.js");
+const {
+  runSearch,
+  ensureToken,
+  API_BASE,
+  DEFAULT_MODEL,
+  startOAuthLogin,
+  pollOAuthLogin,
+} = require("./agent-protocol.js");
 
 const STATE_DIR = process.env.CURSOR_SEARCH_STATE_DIR || path.join(os.homedir(), ".cursor-search-mcp");
 
-/* ---------------- 工具实现 ---------------- */
+/* ================================ CLI ================================ */
+
+async function cliLogin() {
+  try {
+    await ensureToken();
+    console.error("✓ Already logged in (valid credentials present). Re-login: delete " + path.join(STATE_DIR, "auth.json"));
+    process.exit(0);
+  } catch {
+    /* not logged in — proceed */
+  }
+  const { uuid, loginUrl, expiresInMin } = startOAuthLogin();
+  console.error(`\nOpen this URL in a browser to sign in to Cursor (valid for ${expiresInMin} min):\n`);
+  console.error(`  ${loginUrl}\n`);
+  console.error("Waiting for authorization… (Ctrl+C to cancel)\n");
+  try {
+    await pollOAuthLogin(uuid, { timeoutMs: 15 * 60_000 });
+    console.error(`\n✓ Logged in. Token cached at ${path.join(STATE_DIR, "auth.json")}`);
+    process.exit(0);
+  } catch (e) {
+    console.error(`\n✗ ${e.message}`);
+    process.exit(1);
+  }
+}
+
+async function cliStatus() {
+  try {
+    const { fresh } = await ensureToken();
+    console.log(`logged in (${fresh ? "token freshly exchanged" : "cached token valid"})`);
+    process.exit(0);
+  } catch (e) {
+    console.log(`not logged in: ${e.message}`);
+    process.exit(1);
+  }
+}
+
+async function cliSearch(query) {
+  if (!query) {
+    console.error("usage: cursor-search-mcp search <query>");
+    process.exit(1);
+  }
+  try {
+    const r = await runSearch(query);
+    console.log(r.answer);
+    const seen = new Set();
+    const lines = [];
+    for (const ref of r.references) {
+      for (const u of ref.urls) {
+        if (!seen.has(u.url)) {
+          seen.add(u.url);
+          lines.push(`- ${u.title} | ${u.url}`);
+        }
+      }
+    }
+    if (lines.length > 0) {
+      console.log("\nSources:");
+      console.log(lines.join("\n"));
+    }
+    process.exit(0);
+  } catch (e) {
+    console.error(`✗ ${e.message}`);
+    process.exit(1);
+  }
+}
+
+function cliHelp() {
+  console.log(`cursor-search-mcp — Cursor web search as an MCP tool
+
+Usage:
+  cursor-search-mcp               Start the MCP stdio server
+  cursor-search-mcp login         OAuth browser login (prints URL, waits for token)
+  cursor-search-mcp status        Show login state
+  cursor-search-mcp search <q>   One-shot web search
+  cursor-search-mcp help          Show this help
+
+Config:
+  CURSOR_API_KEY                  API key (or file at ${path.join(STATE_DIR, "key")})
+  CURSOR_SEARCH_STATE_DIR        State directory (default ~/.cursor-search-mcp)
+  CURSOR_SEARCH_MODEL             Model for search synthesis (default ${DEFAULT_MODEL})`);
+  process.exit(0);
+}
+
+async function runCli(argv) {
+  const [cmd, ...rest] = argv;
+  if (cmd === "login") return cliLogin();
+  if (cmd === "status") return cliStatus();
+  if (cmd === "search") return cliSearch(rest.join(" "));
+  if (cmd === "help" || cmd === "--help" || cmd === "-h") return cliHelp();
+  return undefined; // unknown → fall through to MCP stdio
+}
+
+/* ============================ MCP stdio ============================ */
+
+const TOOLS = [
+  {
+    name: "cursor_login",
+    description:
+      "Report Cursor login/token status. Credentials come from CURSOR_API_KEY, ~/.cursor-search-mcp/key, or a cached OAuth token.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "cursor_oauth_login",
+    description:
+      "Start OAuth browser login (no API key needed). Returns login_url for the user to open in a browser; " +
+      "then call cursor_oauth_wait with the returned uuid to complete the token exchange.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+  },
+  {
+    name: "cursor_oauth_wait",
+    description:
+      "Wait for the user to finish OAuth browser authorization and exchange the token. Call after cursor_oauth_login's URL was opened.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        uuid: { type: "string", description: "uuid returned by cursor_oauth_login" },
+        timeoutMs: { type: "number", description: "Wait timeout in ms (default 300000 = 5 min)" },
+      },
+      required: ["uuid"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "cursor_web_search",
+    description:
+      "Web search (Cursor server-side, pure protocol). Returns a synthesized answer with source links. Good for latest docs, releases, facts.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        searchTerm: { type: "string", description: "Search query / question" },
+        maxResults: { type: "number", description: "Max source links (default 15)" },
+      },
+      required: ["searchTerm"],
+      additionalProperties: false,
+    },
+  },
+];
+
+function rpcSend(obj) {
+  process.stdout.write(JSON.stringify(obj) + "\n");
+}
+
+// Serialize tool calls (each search is a fresh server-side session; avoid hammering)
+let chain = Promise.resolve();
 
 async function toolLogin() {
   const { fresh } = await ensureToken();
   return {
     ok: true,
-    mode: "protocol-direct（纯协议直连，无 cursor-agent 进程）",
+    mode: "protocol-direct",
     fresh_login: fresh,
     api_base: API_BASE,
     model: DEFAULT_MODEL,
-    note: `token 缓存于 ${STATE_DIR}/auth.json，过期自动重新 exchange`,
+    note: `Token cached at ${path.join(STATE_DIR, "auth.json")}; auto-refreshed on expiry.`,
   };
 }
 
 async function toolSearch(searchTerm, { maxResults } = {}) {
-  if (!searchTerm || typeof searchTerm !== "string") throw new Error("searchTerm 不能为空");
+  if (!searchTerm || typeof searchTerm !== "string") throw new Error("searchTerm required");
   const r = await runSearch(searchTerm);
   const n = maxResults || 5;
-  // 汇总所有引用的链接（去重）
   const seen = new Set();
   const links = [];
   for (const ref of r.references) {
@@ -57,76 +209,25 @@ async function toolSearch(searchTerm, { maxResults } = {}) {
   };
 }
 
-/* ---------------- MCP stdio 协议 ---------------- */
-
-const TOOLS = [
-  {
-    name: "cursor_login",
-    description:
-      "校验 Cursor API key 并报告登录/token 状态。key 经 CURSOR_API_KEY 环境变量或 ~/.cursor-search-mcp/key 配置。",
-    inputSchema: { type: "object", properties: {}, additionalProperties: false },
-  },
-  {
-    name: "cursor_oauth_login",
-    description:
-      "OAuth 浏览器授权登录（无需 API key）。返回 loginUrl 后需用户在浏览器完成授权；授权后自动轮询换 token 并缓存。" +
-      "适用于无 API 权益的账号。步骤: 1) 调用本工具拿 loginUrl 2) 用户打开 URL 登录 3) 调 cursor_oauth_wait 等待完成。",
-    inputSchema: { type: "object", properties: {}, additionalProperties: false },
-  },
-  {
-    name: "cursor_oauth_wait",
-    description:
-      "等待用户完成 OAuth 浏览器授权并换取 token。在 cursor_oauth_login 返回 loginUrl 并让用户打开后调用。",
-    inputSchema: {
-      type: "object",
-      properties: {
-        uuid: { type: "string", description: "cursor_oauth_login 返回的 uuid" },
-        timeoutMs: { type: "number", description: "等待时长毫秒（默认 300000 = 5 分钟）" },
-      },
-      required: ["uuid"],
-      additionalProperties: false,
-    },
-  },
-  {
-    name: "cursor_web_search",
-    description:
-      "联网搜索（Cursor 服务端 web search，纯协议直连）。返回模型归纳的答案与来源链接列表。适合查最新资料、文档、版本变更。",
-    inputSchema: {
-      type: "object",
-      properties: {
-        searchTerm: { type: "string", description: "搜索词/问题" },
-        maxResults: { type: "number", description: "来源链接上限（默认 15）" },
-      },
-      required: ["searchTerm"],
-      additionalProperties: false,
-    },
-  },
-];
-
-function rpcSend(obj) {
-  process.stdout.write(JSON.stringify(obj) + "\n");
-}
-
-// 协议会话串行（服务端按 requestId 隔离，但避免并发轰炸）
-let chain = Promise.resolve();
-
 async function handleCall(name, args) {
   if (name === "cursor_login") return await toolLogin();
   if (name === "cursor_oauth_login") {
     const { uuid, loginUrl, expiresInMin } = startOAuthLogin();
+    pendingLogin = { loginUrl, expiresAt: Date.now() + expiresInMin * 60_000 };
     return {
       ok: true,
       uuid,
       login_url: loginUrl,
-      instructions: `请用户在浏览器打开上面的 login_url 完成登录授权（${expiresInMin} 分钟内有效），完成后调用 cursor_oauth_wait(uuid="${uuid}") 等待 token。`,
+      instructions: `Ask the user to open login_url in a browser (valid ${expiresInMin} min), then call cursor_oauth_wait(uuid="${uuid}").`,
     };
   }
   if (name === "cursor_oauth_wait") {
     const r = await pollOAuthLogin(args.uuid, { timeoutMs: args.timeoutMs });
-    return { ...r, note: "OAuth 登录完成，token 已缓存；现在可以用 cursor_web_search 了" };
+    pendingLogin = null;
+    return { ...r, note: "Login complete; cursor_web_search is ready." };
   }
   if (name === "cursor_web_search") return await toolSearch(args.searchTerm, { maxResults: args.maxResults });
-  throw new Error(`未知工具: ${name}`);
+  throw new Error(`unknown tool: ${name}`);
 }
 
 let buf = "";
@@ -154,7 +255,6 @@ process.stdin.on("data", (chunk) => {
 
 async function handleRpc(msg) {
   if (msg.method === "initialize") {
-    // 登录状态检查 → 动态 instructions：未登录时把登录链接直接带给 pi/agent
     const loginState = getLoginState();
     let instructions;
     if (loginState.status === "logged-in") {
@@ -163,13 +263,13 @@ async function handleRpc(msg) {
         "Each search runs a fresh agent-loop session server-side.";
     } else if (loginState.status === "pending-oauth") {
       instructions =
-        "⚠️ cursor-search: 未登录 Cursor。已在后台发起 OAuth，请用户在浏览器打开此链接完成登录（15 分钟内有效）：\n" +
+        "⚠️ cursor-search: not logged in. OAuth started in the background — ask the user to open this URL in a browser (valid 15 min):\n" +
         `${loginState.loginUrl}\n` +
-        "授权完成后 token 自动缓存，无需重启，直接用 cursor_web_search 即可。" +
-        "若链接过期可调用 cursor_oauth_login 重新生成。";
+        "After authorization the token is cached automatically; no restart needed, cursor_web_search works right away. " +
+        "If the link expires, call cursor_oauth_login for a new one.";
     } else {
       instructions =
-        "cursor-search: 未登录。调用 cursor_oauth_login 获取登录链接（或设置 CURSOR_API_KEY）。";
+        "cursor-search: not logged in. Call cursor_oauth_login for a login URL (or set CURSOR_API_KEY).";
     }
     return rpcSend({
       jsonrpc: "2.0",
@@ -177,7 +277,7 @@ async function handleRpc(msg) {
       result: {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "cursor-search-mcp", version: "1.2.0" },
+        serverInfo: { name: "cursor-search-mcp", version: "1.3.0" },
         instructions,
       },
     });
@@ -205,7 +305,7 @@ async function handleRpc(msg) {
       rpcSend({
         jsonrpc: "2.0",
         id: msg.id,
-        result: { content: [{ type: "text", text: `错误: ${e.message}` }], isError: true },
+        result: { content: [{ type: "text", text: `error: ${e.message}` }], isError: true },
       });
     }
     return;
@@ -219,15 +319,14 @@ async function handleRpc(msg) {
   }
 }
 
-/* ---------------- 登录状态（供 initialize instructions 用） ---------------- */
+/* ==================== Login state (for initialize instructions) ==================== */
 
-/** 当前 OAuth 待授权信息（startupAuthCheck 发起后记录，initialize 读取；两者共享） */
+/** OAuth login pending info, shared between startupAuthCheck and initialize. */
 let pendingLogin = null; // {loginUrl, expiresAt}
 
 function getLoginState() {
   const fs = require("node:fs");
   const pathMod = require("node:path");
-  // 1. 有 key 或有效 token → 已登录
   let hasApiKey = Boolean(process.env.CURSOR_API_KEY);
   if (!hasApiKey) {
     try {
@@ -244,58 +343,62 @@ function getLoginState() {
       } catch {}
     }
   } catch {}
-  // 2. 待授权的 OAuth 进行中 → 带上链接
   if (pendingLogin && pendingLogin.expiresAt > Date.now()) {
     return { status: "pending-oauth", loginUrl: pendingLogin.loginUrl };
   }
   return { status: "not-logged-in" };
 }
 
-/* ---------------- 启动自检：无凭据时自动 OAuth ---------------- */
+/* ==================== Startup auth check (auto OAuth) ==================== */
 
 /**
- * 启动时检测凭据：无 API key 且无有效缓存 token 时，自动发起 OAuth。
- * 登录 URL 打到 stderr（MCP stdio 的 stdout 只能走 JSON-RPC），
- * 后台静默轮询，拿到 token 落盘后后续搜索直接可用。
- * 完全本地逻辑，复用已逆向的 /auth/poll 协议，不新增任何协议。
+ * On startup without credentials, start OAuth automatically, print the login URL to
+ * stderr (stdout is reserved for JSON-RPC), and poll in the background.
  */
 function startupAuthCheck() {
   const fs = require("node:fs");
-  const keyFile = require("node:path").join(STATE_DIR, "key");
+  const pathMod = require("node:path");
   let hasApiKey = Boolean(process.env.CURSOR_API_KEY);
   if (!hasApiKey) {
     try {
-      hasApiKey = Boolean(fs.readFileSync(keyFile, "utf8").trim());
+      hasApiKey = Boolean(fs.readFileSync(pathMod.join(STATE_DIR, "key"), "utf8").trim());
     } catch {}
   }
-  if (hasApiKey) return; // 有 API key，ensureToken 会自动 exchange，无需 OAuth
-
-  // 无 key：看 token 是否已缓存且未过期
+  if (hasApiKey) return;
   try {
-    const d = JSON.parse(fs.readFileSync(require("node:path").join(STATE_DIR, "auth.json"), "utf8"));
+    const d = JSON.parse(fs.readFileSync(pathMod.join(STATE_DIR, "auth.json"), "utf8"));
     if (d.accessToken) {
       try {
         const p = JSON.parse(Buffer.from(d.accessToken.split(".")[1], "base64url").toString("utf8"));
-        if (typeof p.exp === "number" && p.exp * 1000 > Date.now() + 60_000) return; // token 还活着
+        if (typeof p.exp === "number" && p.exp * 1000 > Date.now() + 60_000) return;
       } catch {}
     }
   } catch {}
 
-  // 需要 OAuth：发起并把 URL 打到 stderr，同时记录给 getLoginState（initialize instructions 用）
   const { uuid, loginUrl, expiresInMin } = startOAuthLogin();
   pendingLogin = { loginUrl, expiresAt: Date.now() + expiresInMin * 60_000 };
   process.stderr.write(
-    "\n[cursor-search-mcp] 未检测到登录凭据，已自动发起 OAuth 登录。\n" +
-      `请在浏览器打开以下 URL 完成授权（${expiresInMin} 分钟内有效）：\n${loginUrl}\n` +
-      "完成授权后 token 会自动缓存，无需其他操作。\n\n"
+    "\n[cursor-search-mcp] No credentials found; started OAuth login automatically.\n" +
+      `Open this URL in a browser to authorize (valid ${expiresInMin} min):\n${loginUrl}\n` +
+      "The token is cached automatically once authorized.\n\n"
   );
-  // 后台静默轮询（最长 15 分钟）；失败不致命——用户仍可用 cursor_oauth_login 工具手动发起
   pollOAuthLogin(uuid, { timeoutMs: 15 * 60_000 })
     .then(() => {
-      pendingLogin = null; // 登录完成，清除待授权状态
-      process.stderr.write("[cursor-search-mcp] OAuth 登录完成，token 已缓存。\n");
+      pendingLogin = null;
+      process.stderr.write("[cursor-search-mcp] OAuth login complete; token cached.\n");
     })
-    .catch((e) => process.stderr.write(`[cursor-search-mcp] 自动登录未完成: ${e.message}\n`));
+    .catch((e) => process.stderr.write(`[cursor-search-mcp] auto login unfinished: ${e.message}\n`));
 }
 
-startupAuthCheck();
+/* ==================== Entry point ==================== */
+
+const argv = process.argv.slice(2);
+const CLI_COMMANDS = new Set(["login", "status", "search", "help", "--help", "-h"]);
+if (argv.length > 0 && CLI_COMMANDS.has(argv[0])) {
+  runCli(argv).catch((e) => {
+    console.error(`✗ ${e.message}`);
+    process.exit(1);
+  });
+} else {
+  startupAuthCheck(); // MCP stdio mode
+}
