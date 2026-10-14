@@ -100,3 +100,7 @@ The client maintains the full agent-loop protocol: KV blob get/set ACKs, 5s clie
 ## License
 
 MIT
+
+---
+
+> **ℹ️ Moved**: development continues in [search-mcp-hub](https://github.com/zzjcool/search-mcp-hub) (`packages/cursor-search-mcp`). This repo is the v1/v2 history archive. npm publishes continue from the monorepo.
