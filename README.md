@@ -42,7 +42,26 @@ export CURSOR_API_KEY=crsr_xxxx
 echo "crsr_xxxx" > ~/.cursor-search-mcp/key
 ```
 
-Or use OAuth (no API key needed): call `cursor_oauth_login`, open the returned URL in a browser, then call `cursor_oauth_wait`.
+Or use OAuth (no API key needed):
+
+1. Call `cursor_oauth_login` → returns `login_url`
+2. Open `login_url` in a browser, sign in
+3. Call `cursor_oauth_wait` with the returned `uuid` → token is exchanged and cached automatically
+
+MCP config without any key (OAuth only):
+
+```json
+{
+  "mcpServers": {
+    "cursor-search": {
+      "command": "npx",
+      "args": ["-y", "cursor-search-mcp"]
+    }
+  }
+}
+```
+
+Then in your agent session: *"call cursor_oauth_login and give me the login URL"* → open it → *"call cursor_oauth_wait"*.
 
 Optional env vars:
 
