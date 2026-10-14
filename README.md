@@ -72,7 +72,50 @@ Optional env vars:
 | `CURSOR_SEARCH_STATE_DIR` | `~/.cursor-search-mcp` | State directory |
 | `CURSOR_CLIENT_VERSION` | `cli-2026.10.01-e373342` | Client version header |
 
-## MCP client config
+## Two transports
+
+### stdio (default, for npx one-liners)
+
+```json
+{
+  "mcpServers": {
+    "cursor-search": {
+      "command": "npx",
+      "args": ["-y", "cursor-search-mcp"],
+      "env": { "CURSOR_API_KEY": "crsr_xxxx" }
+    }
+  }
+}
+```
+
+OAuth on stdio: call `cursor_oauth_login` in the agent session (returns a login URL), open it in a browser, then call `cursor_oauth_wait`. On startup without any credentials the server also prints a login URL to stderr and polls in the background automatically.
+
+### HTTP (for native MCP OAuth — e.g. `pi mcp login cursor-search`)
+
+Start the HTTP server (it listens on 127.0.0.1):
+
+```bash
+npx cursor-search-mcp-http        # or: node http-server.js [port]
+```
+
+Configure pi with a URL server and no Authorization header — pi then treats it as MCP OAuth:
+
+```json
+{
+  "mcpServers": {
+    "cursor-search": {
+      "type": "http",
+      "url": "http://127.0.0.1:7331/"
+    }
+  }
+}
+```
+
+Then `pi mcp login cursor-search` works: pi discovers `/.well-known/oauth-protected-resource`, opens the authorize URL (which bridges to Cursor's PKCE device flow), and stores the token in pi's own credential store. The MCP access token is mapped to the Cursor token internally.
+
+> HTTP mode runs a small local OAuth bridge: MCP authorize → Cursor `loginDeepControl`, MCP token → Cursor `/auth/poll`. Everything stays on 127.0.0.1.
+
+## MCP client config (stdio)
 
 ```json
 {

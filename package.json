@@ -1,13 +1,15 @@
 {
   "name": "cursor-search-mcp",
-  "version": "1.1.0",
-  "description": "Standalone MCP server that extracts Cursor's web search as a tool. Pure protocol client (RunSSE + BidiAppend) — no cursor-agent binary required. Supports API key and OAuth login.",
+  "version": "1.2.0",
+  "description": "Standalone MCP server that extracts Cursor's web search as a tool. Pure protocol client (RunSSE + BidiAppend) — no cursor-agent binary required. Supports API key, OAuth login, and MCP-native OAuth over HTTP.",
   "bin": {
-    "cursor-search-mcp": "./index.js"
+    "cursor-search-mcp": "./index.js",
+    "cursor-search-mcp-http": "./http-server.js"
   },
   "main": "index.js",
   "files": [
     "index.js",
+    "http-server.js",
     "agent-protocol.js",
     "README.md",
     "LICENSE"
