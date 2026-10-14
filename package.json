@@ -1,0 +1,41 @@
+{
+  "name": "cursor-search-mcp",
+  "version": "1.0.0",
+  "description": "Standalone MCP server that extracts Cursor's web search as a tool. Pure protocol client (RunSSE + BidiAppend) — no cursor-agent binary required. Supports API key and OAuth login.",
+  "bin": {
+    "cursor-search-mcp": "./index.js"
+  },
+  "main": "index.js",
+  "files": [
+    "index.js",
+    "agent-protocol.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "start": "node index.js",
+    "test": "node agent-protocol.js \"ripgrep 15.1 release notes\"",
+    "check": "node --check index.js && node --check agent-protocol.js"
+  },
+  "keywords": [
+    "mcp",
+    "cursor",
+    "web-search",
+    "search",
+    "model-context-protocol",
+    "cursor-agent",
+    "mcp-server"
+  ],
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zzjcool/cursor-search-mcp.git"
+  },
+  "homepage": "https://github.com/zzjcool/cursor-search-mcp#readme",
+  "bugs": {
+    "url": "https://github.com/zzjcool/cursor-search-mcp/issues"
+  }
+}
