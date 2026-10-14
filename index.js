@@ -18,7 +18,7 @@ const path = require("node:path");
 const os = require("node:os");
 const { runSearch, ensureToken, API_BASE, DEFAULT_MODEL, startOAuthLogin, pollOAuthLogin } = require("./agent-protocol.js");
 
-const STATE_DIR = path.join(os.homedir(), ".cursor-search-mcp");
+const STATE_DIR = process.env.CURSOR_SEARCH_STATE_DIR || path.join(os.homedir(), ".cursor-search-mcp");
 
 /* ---------------- 工具实现 ---------------- */
 
@@ -154,13 +154,31 @@ process.stdin.on("data", (chunk) => {
 
 async function handleRpc(msg) {
   if (msg.method === "initialize") {
+    // 登录状态检查 → 动态 instructions：未登录时把登录链接直接带给 pi/agent
+    const loginState = getLoginState();
+    let instructions;
+    if (loginState.status === "logged-in") {
+      instructions =
+        "Cursor web search ready. Tools: cursor_web_search (search), cursor_login (status). " +
+        "Each search runs a fresh agent-loop session server-side.";
+    } else if (loginState.status === "pending-oauth") {
+      instructions =
+        "⚠️ cursor-search: 未登录 Cursor。已在后台发起 OAuth，请用户在浏览器打开此链接完成登录（15 分钟内有效）：\n" +
+        `${loginState.loginUrl}\n` +
+        "授权完成后 token 自动缓存，无需重启，直接用 cursor_web_search 即可。" +
+        "若链接过期可调用 cursor_oauth_login 重新生成。";
+    } else {
+      instructions =
+        "cursor-search: 未登录。调用 cursor_oauth_login 获取登录链接（或设置 CURSOR_API_KEY）。";
+    }
     return rpcSend({
       jsonrpc: "2.0",
       id: msg.id,
       result: {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },
-        serverInfo: { name: "cursor-search-mcp", version: "1.0.0" },
+        serverInfo: { name: "cursor-search-mcp", version: "1.2.0" },
+        instructions,
       },
     });
   }
@@ -201,6 +219,38 @@ async function handleRpc(msg) {
   }
 }
 
+/* ---------------- 登录状态（供 initialize instructions 用） ---------------- */
+
+/** 当前 OAuth 待授权信息（startupAuthCheck 发起后记录，initialize 读取；两者共享） */
+let pendingLogin = null; // {loginUrl, expiresAt}
+
+function getLoginState() {
+  const fs = require("node:fs");
+  const pathMod = require("node:path");
+  // 1. 有 key 或有效 token → 已登录
+  let hasApiKey = Boolean(process.env.CURSOR_API_KEY);
+  if (!hasApiKey) {
+    try {
+      hasApiKey = Boolean(fs.readFileSync(pathMod.join(STATE_DIR, "key"), "utf8").trim());
+    } catch {}
+  }
+  if (hasApiKey) return { status: "logged-in" };
+  try {
+    const d = JSON.parse(fs.readFileSync(pathMod.join(STATE_DIR, "auth.json"), "utf8"));
+    if (d.accessToken) {
+      try {
+        const p = JSON.parse(Buffer.from(d.accessToken.split(".")[1], "base64url").toString("utf8"));
+        if (typeof p.exp === "number" && p.exp * 1000 > Date.now() + 60_000) return { status: "logged-in" };
+      } catch {}
+    }
+  } catch {}
+  // 2. 待授权的 OAuth 进行中 → 带上链接
+  if (pendingLogin && pendingLogin.expiresAt > Date.now()) {
+    return { status: "pending-oauth", loginUrl: pendingLogin.loginUrl };
+  }
+  return { status: "not-logged-in" };
+}
+
 /* ---------------- 启动自检：无凭据时自动 OAuth ---------------- */
 
 /**
@@ -231,8 +281,9 @@ function startupAuthCheck() {
     }
   } catch {}
 
-  // 需要 OAuth：发起并把 URL 打到 stderr
+  // 需要 OAuth：发起并把 URL 打到 stderr，同时记录给 getLoginState（initialize instructions 用）
   const { uuid, loginUrl, expiresInMin } = startOAuthLogin();
+  pendingLogin = { loginUrl, expiresAt: Date.now() + expiresInMin * 60_000 };
   process.stderr.write(
     "\n[cursor-search-mcp] 未检测到登录凭据，已自动发起 OAuth 登录。\n" +
       `请在浏览器打开以下 URL 完成授权（${expiresInMin} 分钟内有效）：\n${loginUrl}\n` +
@@ -240,7 +291,10 @@ function startupAuthCheck() {
   );
   // 后台静默轮询（最长 15 分钟）；失败不致命——用户仍可用 cursor_oauth_login 工具手动发起
   pollOAuthLogin(uuid, { timeoutMs: 15 * 60_000 })
-    .then(() => process.stderr.write("[cursor-search-mcp] OAuth 登录完成，token 已缓存。\n"))
+    .then(() => {
+      pendingLogin = null; // 登录完成，清除待授权状态
+      process.stderr.write("[cursor-search-mcp] OAuth 登录完成，token 已缓存。\n");
+    })
     .catch((e) => process.stderr.write(`[cursor-search-mcp] 自动登录未完成: ${e.message}\n`));
 }
 
