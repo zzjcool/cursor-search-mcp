@@ -200,3 +200,48 @@ async function handleRpc(msg) {
     });
   }
 }
+
+/* ---------------- 启动自检：无凭据时自动 OAuth ---------------- */
+
+/**
+ * 启动时检测凭据：无 API key 且无有效缓存 token 时，自动发起 OAuth。
+ * 登录 URL 打到 stderr（MCP stdio 的 stdout 只能走 JSON-RPC），
+ * 后台静默轮询，拿到 token 落盘后后续搜索直接可用。
+ * 完全本地逻辑，复用已逆向的 /auth/poll 协议，不新增任何协议。
+ */
+function startupAuthCheck() {
+  const fs = require("node:fs");
+  const keyFile = require("node:path").join(STATE_DIR, "key");
+  let hasApiKey = Boolean(process.env.CURSOR_API_KEY);
+  if (!hasApiKey) {
+    try {
+      hasApiKey = Boolean(fs.readFileSync(keyFile, "utf8").trim());
+    } catch {}
+  }
+  if (hasApiKey) return; // 有 API key，ensureToken 会自动 exchange，无需 OAuth
+
+  // 无 key：看 token 是否已缓存且未过期
+  try {
+    const d = JSON.parse(fs.readFileSync(require("node:path").join(STATE_DIR, "auth.json"), "utf8"));
+    if (d.accessToken) {
+      try {
+        const p = JSON.parse(Buffer.from(d.accessToken.split(".")[1], "base64url").toString("utf8"));
+        if (typeof p.exp === "number" && p.exp * 1000 > Date.now() + 60_000) return; // token 还活着
+      } catch {}
+    }
+  } catch {}
+
+  // 需要 OAuth：发起并把 URL 打到 stderr
+  const { uuid, loginUrl, expiresInMin } = startOAuthLogin();
+  process.stderr.write(
+    "\n[cursor-search-mcp] 未检测到登录凭据，已自动发起 OAuth 登录。\n" +
+      `请在浏览器打开以下 URL 完成授权（${expiresInMin} 分钟内有效）：\n${loginUrl}\n` +
+      "完成授权后 token 会自动缓存，无需其他操作。\n\n"
+  );
+  // 后台静默轮询（最长 15 分钟）；失败不致命——用户仍可用 cursor_oauth_login 工具手动发起
+  pollOAuthLogin(uuid, { timeoutMs: 15 * 60_000 })
+    .then(() => process.stderr.write("[cursor-search-mcp] OAuth 登录完成，token 已缓存。\n"))
+    .catch((e) => process.stderr.write(`[cursor-search-mcp] 自动登录未完成: ${e.message}\n`));
+}
+
+startupAuthCheck();
